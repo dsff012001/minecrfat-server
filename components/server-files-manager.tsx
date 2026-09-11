@@ -1,0 +1,97 @@
+'use client'
+
+import { useMemo, useRef, useState } from 'react'
+import useSWR from 'swr'
+import JSZip from 'jszip'
+import { Archive, Check, Clock3, Download, FileCog, FileUp, HardDrive, Loader2, MoreHorizontal, RefreshCw, Search, ShieldCheck, Trash2, UploadCloud } from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
+
+type Entry = { name: string; category: string }
+type FileRecord = { id: string; type: string; status: string; payload: { filename?: string; entries?: Entry[]; category?: string }; result?: { error?: string; path?: string; filename?: string; category?: string; world?: string }; createdAt: string }
+async function readJson(response: Response) { const text = await response.text(); try { return text ? JSON.parse(text) : {} } catch { throw new Error(response.ok ? 'Sunucudan geçersiz yanıt alındı' : `Sunucu hatası (${response.status}): ${text.slice(0, 180)}`) } }
+const MAX_DIRECT_UPLOAD = 2 * 1024 * 1024 * 1024
+async function directUploadFile(serverId: string, file: File, category: string, onProgress?: (percent: number) => void) {
+  const started = await fetch('/api/direct-upload', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'start', serverId, filename: file.name, size: file.size, category }) })
+  const startData = await readJson(started) as { error?: string; uploadId?: string; commandId?: string; chunkSize?: number; totalParts?: number }
+  if (!started.ok || !startData.uploadId || !startData.commandId || !startData.chunkSize) throw new Error(startData.error ?? `Yükleme başlatılamadı (${started.status})`)
+  const { uploadId, commandId, chunkSize } = startData
+  const totalParts = Math.ceil(file.size / chunkSize)
+  for (let part = 0; part < totalParts; part++) {
+    const from = part * chunkSize; const to = Math.min(file.size, from + chunkSize); const chunk = file.slice(from, to)
+    let lastError = ''
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const response = await fetch(`/api/direct-upload?commandId=${encodeURIComponent(commandId)}&uploadId=${encodeURIComponent(uploadId)}&part=${part}`, { method: 'PUT', headers: { 'content-type': 'application/octet-stream' }, body: chunk })
+        const data = await readJson(response) as { error?: string }; if (!response.ok) throw new Error(data.error ?? `Parça ${part + 1} yüklenemedi`)
+        lastError = ''; break
+      } catch (error) { lastError = error instanceof Error ? error.message : 'Parça yüklenemedi'; if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 750 * (attempt + 1))) }
+    }
+    if (lastError) throw new Error(lastError)
+    onProgress?.(Math.round(((part + 1) / totalParts) * 100))
+  }
+  const completed = await fetch('/api/direct-upload', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'complete', commandId, uploadId }) })
+  const completeData = await readJson(completed) as { error?: string; result?: unknown }; if (!completed.ok) throw new Error(completeData.error ?? 'Yükleme tamamlanamadı')
+  return completeData
+}
+const fetcher = (url: string) => fetch(url).then(async response => { const data = await readJson(response); if (!response.ok) throw new Error(data.error ?? 'Dosyalar yüklenemedi'); return data as { files: FileRecord[] } })
+const categoryLabel: Record<string, string> = { mods: 'Modlar', plugins: 'Pluginler', config: 'Config', worlds: 'Dünyalar', other: 'Diğer' }
+export function ServerFilesManager({ serverId, disabled }: { serverId: string; disabled?: boolean }) {
+  const inputRef = useRef<HTMLInputElement>(null); const [dragging, setDragging] = useState(false); const [file, setFile] = useState<File | null>(null); const [preview, setPreview] = useState<{ entries: Entry[]; rejected: string[] } | null>(null); const [notice, setNotice] = useState(''); const [busy, setBusy] = useState(false); const [query, setQuery] = useState('')
+  const { data, error, mutate } = useSWR(`/api/files?serverId=${serverId}`, fetcher, { refreshInterval: 4000 })
+  const records = useMemo(() => (data?.files ?? []).filter(item => !query || (item.payload.filename ?? '').toLowerCase().includes(query.toLowerCase())), [data, query])
+  function recordPath(record: FileRecord) {
+    if (record.result?.path) return record.result.path
+    const filename = record.result?.filename ?? record.payload.filename
+    const category = record.result?.category ?? record.payload.category
+    if (!filename) return null
+    if (category === 'mods' || category === 'plugins') return `${category}/${filename}`
+    if (category === 'configs' || category === 'config') return filename === 'server.properties' ? filename : `config/${filename}`
+    if (category === 'resource-packs') return `resourcepacks/${filename}`
+    return null
+  }
+  async function removeRecord(record: FileRecord) {
+    const path = recordPath(record); if (!path) { setNotice('Bu kayıt tek bir dosyaya karşılık gelmediği için buradan silinemez.'); return }
+    if (!window.confirm(`${path} silinsin mi?`)) return
+    setBusy(true); setNotice('Dosya silme işlemi hazırlanıyor...')
+    try { const response = await fetch('/api/files', { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ serverId, path }) }); const data = await readJson(response) as { error?: string }; if (!response.ok) throw new Error(data.error ?? 'Dosya silinemedi'); setNotice(`${path} silme işlemi kuyruğa alındı.`); await mutate() } catch (cause) { setNotice(cause instanceof Error ? cause.message : 'Dosya silinemedi') } finally { setBusy(false) }
+  }
+  async function inspect(next: File) { setFile(next); setPreview(null); setNotice(''); if (next.size > MAX_DIRECT_UPLOAD) { setNotice('Dosya 2 GB sınırını aşamaz.'); return } if (!next.name.toLowerCase().endsWith('.zip')) return; if (next.size > 64 * 1024 * 1024) { setNotice('Büyük ZIP seçildi. Tarayıcı belleğini korumak için önizleme atlandı; yükleme parçalara bölünerek sunucuya gönderilecek.'); return } try { const zip = await JSZip.loadAsync(await next.arrayBuffer()); const entries: Entry[] = []; const rejected: string[] = []; for (const entry of Object.values(zip.files)) { if (entry.dir) continue; const normalized = entry.name.replace(/\\/g, '/').split('/').filter(part => part && part !== '.' && part !== '..').join('/'); const lower = normalized.toLowerCase(); const category = lower.startsWith('mods/') || lower.endsWith('.jar') ? 'mods' : lower.startsWith('plugins/') ? 'plugins' : lower.startsWith('config/') || /\\.(yml|yaml|json|properties|toml|ini|cfg|conf|txt)$/.test(lower) ? 'config' : lower.startsWith('world/') || lower.startsWith('worlds/') ? 'worlds' : 'other'; if (normalized && !entry.name.startsWith('/') && !entry.name.split('/').includes('..')) entries.push({ name: normalized, category }); else rejected.push(entry.name) } setPreview({ entries, rejected }) } catch (cause) { setNotice(cause instanceof Error ? `ZIP okunamadı: ${cause.message}` : 'Geçersiz ZIP dosyası') } }
+  async function upload(_confirm = false) { if (!file) return; if (file.size > MAX_DIRECT_UPLOAD) { setNotice('Dosya 2 GB sınırını aşamaz.'); return } const lower = file.name.toLowerCase(); const category = lower.endsWith('.zip') ? 'auto' : lower.endsWith('.jar') ? 'mods' : /\.(yml|yaml|json|properties|toml|ini|cfg|conf|txt)$/.test(lower) ? 'configs' : 'auto'; setBusy(true); setNotice('Yükleme hazırlanıyor...'); try { await directUploadFile(serverId, file, category, percent => setNotice(`Dosya sunucuya gönderiliyor: %${percent}`)); const filename = file.name; setFile(null); setPreview(null); setNotice(`${filename} sunucuya yüklendi. Mevcut dosya varsa .bak olarak korunur.`); await mutate() } catch (cause) { setNotice(cause instanceof Error ? cause.message : 'Yükleme başarısız') } finally { setBusy(false) } }
+  return <div className="grid gap-3 xl:grid-cols-[1fr_330px]">
+    <div className="space-y-3">
+      <section className="rounded-xl border border-emerald-950/70 bg-[linear-gradient(145deg,rgba(15,33,26,.92),rgba(8,23,18,.92))] p-4">
+        <input ref={inputRef} type="file" className="hidden" accept=".jar,.zip,.yml,.yaml,.json,.properties,.toml,.ini,.cfg,.conf,.txt" onChange={event => { const selected = event.target.files?.[0]; if (selected) void inspect(selected) }} />
+        <button type="button" disabled={disabled || busy} onDragOver={event => { event.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={event => { event.preventDefault(); setDragging(false); const dropped = event.dataTransfer.files[0]; if (dropped) void inspect(dropped) }} onClick={() => inputRef.current?.click()} className={`flex min-h-[205px] w-full flex-col items-center justify-center rounded-xl border border-dashed px-6 py-8 text-center transition ${dragging ? 'border-emerald-300 bg-emerald-400/10' : 'border-emerald-800/70 bg-black/10 hover:bg-emerald-950/15'} disabled:cursor-not-allowed disabled:opacity-50`}>
+          <UploadCloud className="mb-3 size-10 text-emerald-300" />
+          <span className="text-sm font-semibold text-white">Tek dosya veya ZIP sürükleyin</span>
+          <span className="mt-2 max-w-2xl text-xs leading-5 text-slate-400">ZIP içeriği modlar, eklentiler, yapılandırma, dünyalar, yedekler ve diğer uygun klasörlere otomatik olarak dağıtılır.</span>
+          <span className="mt-4 rounded-md border border-emerald-700/70 bg-emerald-500/5 px-4 py-2 text-xs font-semibold text-slate-100"><FileUp className="mr-2 inline size-4"/>Dosya seç</span>
+          <span className="mt-2 text-[10px] text-slate-500">Maksimum doğrudan yükleme: 2 GB</span>
+        </button>
+        {file && <div className="mt-3 rounded-xl border border-emerald-950/70 bg-[#07130f] p-4"><div className="flex flex-wrap items-center justify-between gap-3"><div className="flex min-w-0 items-center gap-3"><div className="grid size-10 place-items-center rounded-lg bg-emerald-500/10 text-emerald-300"><Archive className="size-5"/></div><div className="min-w-0"><p className="truncate text-sm font-semibold text-white">{file.name}</p><p className="mt-1 text-[10px] text-slate-500">{(file.size / 1048576).toFixed(2)} MB · yüklemeye hazır</p></div></div><Button onClick={() => void upload(Boolean(preview))} disabled={busy} className="bg-emerald-600 text-emerald-950 hover:bg-emerald-500">{busy ? <Loader2 className="mr-2 size-4 animate-spin" /> : <Check className="mr-2 size-4" />}{preview ? 'Önizlemeyi onayla' : 'Yükle'}</Button></div>{preview && <div className="mt-4 grid gap-1.5 text-xs"><p className="mb-1 font-semibold text-slate-200">{preview.entries.length} dosya bulundu</p>{preview.entries.slice(0, 10).map(entry => <div key={entry.name} className="flex items-center justify-between gap-3 rounded-md border border-emerald-950/55 bg-black/10 px-3 py-2"><span className="truncate text-slate-300">{entry.name}</span><span className="shrink-0 rounded-full bg-emerald-500/10 px-2 py-1 text-[10px] text-emerald-300">{categoryLabel[entry.category]}</span></div>)}{preview.entries.length>10&&<p className="pt-1 text-[10px] text-slate-500">+ {preview.entries.length-10} dosya daha</p>}{preview.rejected.length > 0 && <p className="mt-1 text-amber-300">{preview.rejected.length} güvensiz yol reddedilecek.</p>}</div>}</div>}
+        {notice && <p role="status" className="mt-3 rounded-lg border border-emerald-500/25 bg-emerald-950/25 px-4 py-3 text-xs text-emerald-200">{notice}</p>}
+      </section>
+
+      <section className="overflow-hidden rounded-xl border border-emerald-950/70 bg-[linear-gradient(145deg,rgba(15,33,26,.92),rgba(8,23,18,.92))]">
+        <div className="flex flex-wrap items-center gap-2 border-b border-emerald-950/65 p-3">
+          <div className="relative min-w-[240px] flex-1"><Search className="absolute left-3 top-2.5 size-4 text-slate-500"/><Input value={query} onChange={event => setQuery(event.target.value)} placeholder="Dosya ara..." className="h-9 border-emerald-950/80 bg-[#091712] pl-9 text-xs" /></div>
+          <Button size="sm" variant="outline" className="h-9 border-emerald-950/80" onClick={()=>mutate()}><RefreshCw className="mr-2 size-4"/>Yenile</Button>
+          <Button size="sm" variant="outline" className="h-9 border-emerald-950/80" onClick={() => inputRef.current?.click()} disabled={disabled || busy}><FileUp className="mr-2 size-4"/>Dosya seç</Button>
+        </div>
+        {error ? <p className="p-6 text-sm text-red-300">{error.message}</p> : records.length === 0 ? <p className="p-8 text-center text-xs text-slate-500">Henüz yükleme kaydı yok.</p> : <div className="overflow-x-auto"><table className="w-full min-w-[760px] text-left text-xs"><thead className="bg-white/[.025] text-slate-400"><tr><th className="px-4 py-3 font-medium">Ad</th><th className="px-4 py-3 font-medium">Tür</th><th className="px-4 py-3 font-medium">Konum</th><th className="px-4 py-3 font-medium">Son değiştirilme</th><th className="px-4 py-3 font-medium">Durum</th><th className="px-4 py-3 font-medium">İşlemler</th></tr></thead><tbody>{records.map(record => { const name=record.result?.filename ?? record.payload.filename ?? record.type; const path=recordPath(record); return <tr key={record.id} className="border-t border-emerald-950/55"><td className="px-4 py-3"><div className="flex items-center gap-3"><div className="grid size-8 place-items-center rounded-md bg-slate-800/70 text-slate-300"><FileCog className="size-4"/></div><div className="min-w-0"><p className="max-w-[300px] truncate font-semibold text-white">{name}</p><p className="mt-0.5 max-w-[300px] truncate text-[10px] text-slate-500">{path ? `/${path}` : 'Yükleme işlemi'}</p></div></div></td><td className="px-4 py-3"><span className="rounded-full bg-slate-700/50 px-2 py-1 text-[10px] uppercase text-slate-300">{record.payload.category ?? record.type}</span></td><td className="px-4 py-3 font-mono text-[10px] text-slate-500">{path ?? '—'}</td><td className="px-4 py-3 text-slate-400">{new Date(record.createdAt).toLocaleString('tr-TR')}</td><td className="px-4 py-3"><span className={`inline-flex items-center gap-1.5 ${record.status==='failed'?'text-red-300':record.status==='running'||record.status==='queued'?'text-blue-300':'text-emerald-300'}`}><span className={`size-1.5 rounded-full ${record.status==='failed'?'bg-red-400':record.status==='running'||record.status==='queued'?'bg-blue-400':'bg-emerald-400'}`}/>{record.status==='failed'?'Engellendi':record.status==='running'||record.status==='queued'?'İşleniyor':'Başarılı'}</span>{record.result?.error && <p className="mt-1 max-w-[220px] truncate text-[10px] text-red-300">{record.result.error}</p>}</td><td className="px-4 py-3"><div className="flex gap-1"><Button size="icon" variant="ghost" aria-label="Dosyayı indir" className="size-7" disabled><Download className="size-3.5"/></Button><Button size="icon" variant="ghost" aria-label="Diğer işlemler" className="size-7"><MoreHorizontal className="size-3.5"/></Button><Button size="icon" variant="ghost" aria-label="Dosyayı sil" className="size-7" disabled={disabled || busy || !path} onClick={() => void removeRecord(record)}><Trash2 className="size-3.5 text-red-300" /></Button></div></td></tr>})}</tbody></table></div>}
+        <div className="flex items-center justify-between border-t border-emerald-950/55 px-4 py-3 text-[10px] text-slate-500"><span>{records.length} kayıt gösteriliyor</span><span className="flex items-center gap-1.5"><FileCog className="size-3.5"/>Metin düzenleme ve silme işlemleri sunucu durdurulduğunda çalışır.</span></div>
+      </section>
+      <div className="flex items-start gap-3 rounded-xl border border-blue-500/30 bg-blue-950/20 p-3 text-xs text-blue-200"><ShieldCheck className="mt-0.5 size-4 shrink-0"/><div><b>Güvenlik notu</b><p className="mt-1 text-[10px] leading-5 text-blue-200/70">Yüklenen dosyalar agent kuyruğunda doğrulanır. Şüpheli veya işlenemeyen dosyalar başarısız olarak işaretlenir.</p></div></div>
+    </div>
+
+    <aside className="space-y-3">
+      <section className="rounded-xl border border-emerald-950/70 bg-[linear-gradient(145deg,rgba(15,33,26,.92),rgba(8,23,18,.92))] p-4"><div className="mb-3 flex items-start gap-3"><div className="grid size-9 place-items-center rounded-lg bg-emerald-500/10 text-emerald-300"><ShieldCheck className="size-5"/></div><div><h3 className="text-sm font-semibold text-white">Yükleme güvenliği</h3><p className="mt-0.5 text-[10px] text-slate-500">Sunucunuzun güvenliği için yüklemeler kontrol edilir.</p></div></div><SecurityRow label="Zararlı dosya taraması" status="Aktif"/><SecurityRow label="SHA-256 doğrulama" status="Açık"/><SecurityRow label="Yasaklı uzantı filtresi" status="Açık"/><SecurityRow label="Karantina" status="Hazır"/><SecurityRow label="Maks. yükleme" status="2 GB"/></section>
+      <section className="rounded-xl border border-emerald-950/70 bg-[linear-gradient(145deg,rgba(15,33,26,.92),rgba(8,23,18,.92))] p-4"><div className="mb-3 flex items-center gap-3"><HardDrive className="size-5 text-emerald-300"/><div><h3 className="text-sm font-semibold">Yükleme kayıtları</h3><p className="text-[10px] text-slate-500">Bu sayfada görünen işlem sayısı</p></div></div><div className="text-2xl font-semibold text-white">{data?.files?.length ?? 0}</div><div className="mt-3 h-2 rounded-full bg-slate-800"><div className="h-full rounded-full bg-emerald-400" style={{width:`${Math.min(100,(data?.files?.length??0)*8)}%`}}/></div><p className="mt-2 text-[10px] text-slate-500">Başarılı: {(data?.files??[]).filter(x=>x.status!=='failed').length} · Engellenen: {(data?.files??[]).filter(x=>x.status==='failed').length}</p></section>
+      <section className="rounded-xl border border-emerald-950/70 bg-[linear-gradient(145deg,rgba(15,33,26,.92),rgba(8,23,18,.92))] p-4"><div className="mb-3 flex items-center gap-3"><Clock3 className="size-5 text-emerald-300"/><div><h3 className="text-sm font-semibold">Son yüklemeler</h3><p className="text-[10px] text-slate-500">Yükleme ve tarama sonuçları</p></div></div><div className="space-y-1">{(data?.files??[]).slice(0,6).map(record=><div key={record.id} className="flex items-center gap-2 border-b border-emerald-950/45 py-2 last:border-0"><FileCog className="size-4 shrink-0 text-slate-400"/><div className="min-w-0 flex-1"><p className="truncate text-[11px] text-slate-200">{record.result?.filename ?? record.payload.filename ?? record.type}</p><p className={`mt-0.5 text-[9px] ${record.status==='failed'?'text-red-300':'text-emerald-300'}`}>{record.status==='failed'?'Engellendi':'Başarılı'}</p></div><span className="text-[9px] text-slate-600">{new Date(record.createdAt).toLocaleDateString('tr-TR')}</span></div>)}{!(data?.files??[]).length&&<p className="py-5 text-center text-[10px] text-slate-500">Henüz yükleme yok.</p>}</div></section>
+    </aside>
+  </div>
+}
+
+function SecurityRow({label,status}:{label:string;status:string}){return <div className="flex items-center gap-3 border-b border-emerald-950/45 py-2.5 last:border-0"><div className="grid size-7 place-items-center rounded-lg bg-emerald-500/[.08] text-emerald-300"><ShieldCheck className="size-3.5"/></div><span className="min-w-0 flex-1 text-[11px] text-slate-200">{label}</span><span className="flex items-center gap-1.5 text-[10px] text-slate-300"><span className="size-1.5 rounded-full bg-emerald-400"/>{status}</span></div>}
